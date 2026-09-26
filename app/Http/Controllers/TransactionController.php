@@ -8,57 +8,155 @@ use Illuminate\Http\Request;
 
 class TransactionController extends Controller
 {
-    // Menampilkan halaman transaksi kasir
     public function index()
     {
         $products = Product::where('stok', '>', 0)->get();
-        $transactions = Transaction::with('product')->latest()->get();
+
+        $transactions = Transaction::with('product')
+            ->latest()
+            ->get();
+
         return view('transactions.index', compact('products', 'transactions'));
     }
 
-    // Memproses transaksi penjualan
+    // ==========================================
+    // CARI PRODUK BERDASARKAN BARCODE
+    // ==========================================
+    public function findByBarcode($barcode)
+    {
+        $product = Product::where('barcode', $barcode)
+            ->where('stok', '>', 0)
+            ->first();
+
+        if (!$product) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Produk tidak ditemukan atau stok habis.'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'product' => [
+                'id' => $product->id,
+                'barcode' => $product->barcode,
+                'kode_produk' => $product->kode_produk,
+                'nama_produk' => $product->nama_produk,
+                'harga' => $product->harga,
+                'stok' => $product->stok,
+                'foto' => $product->foto,
+            ]
+        ]);
+    }
+
+    // ==========================================
+    // PROSES PEMBAYARAN
+    // ==========================================
     public function store(Request $request)
     {
         $request->validate([
-            'product_id' => 'required|exists:products,id',
-            'jumlah'     => 'required|integer|min:1',
-            'bayar'      => 'required|numeric',
+            'cart' => 'required|array|min:1',
+            'bayar' => 'required|numeric|min:0',
         ]);
 
-        $product = Product::findOrFail($request->product_id);
+        $cart = $request->cart;
 
-        if ($product->stok < $request->jumlah) {
-            return redirect()->back()->with('error', 'Stok produk tidak mencukupi!');
+        $totalHargaSemua = 0;
+
+        // ------------------------------------------
+        // CEK PRODUK DAN STOK
+        // ------------------------------------------
+        foreach ($cart as $item) {
+
+            $product = Product::findOrFail($item['product_id']);
+
+            $jumlah = (int) $item['jumlah'];
+
+            if ($jumlah <= 0) {
+                return redirect()
+                    ->back()
+                    ->with('error', 'Jumlah produk tidak valid.');
+            }
+
+            if ($product->stok < $jumlah) {
+                return redirect()
+                    ->back()
+                    ->with(
+                        'error',
+                        'Stok ' . $product->nama_produk . ' tidak mencukupi!'
+                    );
+            }
+
+            $totalHargaSemua += $product->harga * $jumlah;
         }
 
-        $totalHarga = $product->harga * $request->jumlah;
-
-        if ($request->bayar < $totalHarga) {
-            return redirect()->back()->with('error', 'Uang pembayaran kurang!');
+        // ------------------------------------------
+        // CEK UANG PEMBAYARAN
+        // ------------------------------------------
+        if ($request->bayar < $totalHargaSemua) {
+            return redirect()
+                ->back()
+                ->with('error', 'Uang pembayaran kurang!');
         }
 
-        $kembalian = $request->bayar - $totalHarga;
+        $kembalian = $request->bayar - $totalHargaSemua;
 
-        // Simpan Transaksi
-        Transaction::create([
-            'kode_transaksi' => 'TRX-' . time(),
-            'product_id'     => $product->id,
-            'jumlah'         => $request->jumlah,
-            'total_harga'    => $totalHarga,
-            'bayar'          => $request->bayar,
-            'kembalian'      => $kembalian,
-        ]);
+        // ------------------------------------------
+        // BUAT KODE TRANSAKSI
+        // ------------------------------------------
+        $kodeTransaksi = 'TRX-' . date('YmdHis') . '-' . strtoupper(substr(uniqid(), -4));
 
-        // Kurangi Stok Produk
-        $product->decrement('stok', $request->jumlah);
+        $lastTransaction = null;
 
-        return redirect()->back()->with('success', 'Transaksi berhasil disimpan!');
+        // ------------------------------------------
+        // SIMPAN SEMUA PRODUK
+        // ------------------------------------------
+        foreach ($cart as $item) {
+
+            $product = Product::findOrFail($item['product_id']);
+
+            $jumlah = (int) $item['jumlah'];
+
+            $totalHargaItem = $product->harga * $jumlah;
+
+            $lastTransaction = Transaction::create([
+                'kode_transaksi' => $kodeTransaksi,
+                'product_id' => $product->id,
+                'jumlah' => $jumlah,
+                'total_harga' => $totalHargaItem,
+                'bayar' => $request->bayar,
+                'kembalian' => $kembalian,
+            ]);
+
+            // Kurangi stok
+            $product->decrement('stok', $jumlah);
+        }
+
+        // ------------------------------------------
+        // KEMBALI KE HALAMAN KASIR
+        // + SIMPAN ID TRANSAKSI UNTUK CETAK STRUK
+        // ------------------------------------------
+        return redirect()
+            ->route('transactions.index')
+            ->with('success', 'Transaksi berhasil diproses!')
+            ->with('print_transaction_id', $lastTransaction->id);
     }
 
-    // Fitur Cetak Struk Nota
+    // ==========================================
+    // CETAK STRUK
+    // ==========================================
     public function printStruk($id)
     {
-        $transaction = Transaction::with('product')->findOrFail($id);
-        return view('transactions.print', compact('transaction'));
+        $transaction = Transaction::findOrFail($id);
+
+        // Ambil semua barang dalam transaksi yang sama
+        $transactions = Transaction::with('product')
+            ->where('kode_transaksi', $transaction->kode_transaksi)
+            ->get();
+
+        return view('transactions.print', compact(
+            'transaction',
+            'transactions'
+        ));
     }
 }
